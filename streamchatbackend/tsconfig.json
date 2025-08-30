@@ -13,3 +13,8 @@
         "ignoreDeprecations": "6.0"
     }
 }
+
+//In case of error popping on the terminal (while starting backened server) -  related to "ignoreDeprecations" 
+// cut the last line that is "ignoreDeprecations": "6.0" 
+//this will show warning  in "Problem" Tab of the terminal , ignore that ans start the server - it is just warning by typescript, wont throw error
+//after starting the server paste the "ignoreDeprecations": "6.0" where it was , evreything should work fine
