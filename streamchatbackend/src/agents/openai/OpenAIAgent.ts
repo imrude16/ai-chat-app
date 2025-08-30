@@ -1,15 +1,12 @@
 import OpenAI from "openai";
 import type { Channel, DefaultGenerics, Event, StreamChat } from "stream-chat";
 import type { AIAgent } from "../types";
-import { OpenAIResposnseHandler } from "./OpenAIResponseHandler";
 
 export class OpenAIAgent implements AIAgent {
   private openai?: OpenAI;
-  private assistant?: OpenAI.Beta.Assistants.Assistant;
-  private openAiThread?: OpenAI.Beta.Threads.Thread;
+  private conversationHistory: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
   private lastInteractionTs = Date.now();
-
-  private handlers: OpenAIResposnseHandler[] = [];
+  private activeStreamControllers: AbortController[] = [];
 
   constructor(
     readonly chatClient: StreamChat,
@@ -18,10 +15,12 @@ export class OpenAIAgent implements AIAgent {
 
   dispose = async () => {
     this.chatClient.off("message.new", this.handleMessage);
+    this.chatClient.off("ai_indicator.stop", this.handleStopGenerating);
     await this.chatClient.disconnectUser();
 
-    this.handlers.forEach((handler) => handler.dispose());
-    this.handlers = [];
+    // Cancel any active streams
+    this.activeStreamControllers.forEach(controller => controller.abort());
+    this.activeStreamControllers = [];
   };
 
   get user() {
@@ -31,42 +30,27 @@ export class OpenAIAgent implements AIAgent {
   getLastInteraction = (): number => this.lastInteractionTs;
 
   init = async () => {
-    const apiKey = process.env.OPENAI_API_KEY as string | undefined;
+    const apiKey = process.env.GEMINI_API_KEY as string | undefined;
     if (!apiKey) {
-      throw new Error("OpenAI API key is required");
+      throw new Error("Gemini API key is required");
     }
 
-    this.openai = new OpenAI({ apiKey });
-    this.assistant = await this.openai.beta.assistants.create({
-      name: "AI Writing Assistant",
-      instructions: this.getWritingAssistantPrompt(),
-      model: "gpt-4o",
-      tools: [
-        { type: "code_interpreter" },
-        {
-          type: "function",
-          function: {
-            name: "web_search",
-            description:
-              "Search the web for current information, news, facts, or research on any topic",
-            parameters: {
-              type: "object",
-              properties: {
-                query: {
-                  type: "string",
-                  description: "The search query to find information about",
-                },
-              },
-              required: ["query"],
-            },
-          },
-        },
-      ],
-      temperature: 0.7,
+    // Initialize OpenAI client with Gemini's OpenAI-compatible endpoint
+    this.openai = new OpenAI({ 
+      apiKey,
+      baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/"
     });
-    this.openAiThread = await this.openai.beta.threads.create();
+
+    // Initialize conversation with system prompt
+    this.conversationHistory = [
+      {
+        role: "system",
+        content: this.getWritingAssistantPrompt()
+      }
+    ];
 
     this.chatClient.on("message.new", this.handleMessage);
+    this.chatClient.on("ai_indicator.stop", this.handleStopGenerating);
   };
 
   private getWritingAssistantPrompt = (context?: string): string => {
@@ -99,7 +83,7 @@ Your goal is to provide accurate, current, and helpful written content. Failure 
   };
 
   private handleMessage = async (e: Event<DefaultGenerics>) => {
-    if (!this.openai || !this.openAiThread || !this.assistant) {
+    if (!this.openai) {
       console.log("OpenAI not initialized");
       return;
     }
@@ -115,13 +99,28 @@ Your goal is to provide accurate, current, and helpful written content. Failure 
 
     const writingTask = (e.message.custom as { writingTask?: string })
       ?.writingTask;
-    const context = writingTask ? `Writing Task: ${writingTask}` : undefined;
-    const instructions = this.getWritingAssistantPrompt(context);
+    
+    // Update system prompt if there's a specific writing task
+    if (writingTask) {
+      this.conversationHistory[0] = {
+        role: "system",
+        content: this.getWritingAssistantPrompt(`Writing Task: ${writingTask}`)
+      };
+    }
 
-    await this.openai.beta.threads.messages.create(this.openAiThread.id, {
+    // Add user message to conversation history
+    this.conversationHistory.push({
       role: "user",
-      content: message,
+      content: message
     });
+
+    // Keep conversation history manageable (last 20 messages)
+    if (this.conversationHistory.length > 21) {
+      this.conversationHistory = [
+        this.conversationHistory[0], // Keep system prompt
+        ...this.conversationHistory.slice(-20) // Keep last 20 messages
+      ];
+    }
 
     const { message: channelMessage } = await this.channel.sendMessage({
       text: "",
@@ -135,29 +134,247 @@ Your goal is to provide accurate, current, and helpful written content. Failure 
       message_id: channelMessage.id,
     });
 
-    const run = this.openai.beta.threads.runs.createAndStream(
-      this.openAiThread.id,
-      {
-        assistant_id: this.assistant.id,
-      }
-    );
-
-    const handler = new OpenAIResposnseHandler(
-      this.openai,
-      this.openAiThread,
-      run,
-      this.chatClient,
-      this.channel,
-      channelMessage,
-      () => this.removeHandler(handler)
-    );
-    this.handlers.push(handler);
-    void handler.run();
+    await this.processMessageWithGemini(channelMessage);
   };
 
-  private removeHandler = (handlerToRemove: OpenAIResposnseHandler) => {
-    this.handlers = this.handlers.filter(
-      (handler) => handler !== handlerToRemove
-    );
+  private processMessageWithGemini = async (channelMessage: any) => {
+    if (!this.openai) return;
+
+    const controller = new AbortController();
+    this.activeStreamControllers.push(controller);
+
+    try {
+      await this.channel.sendEvent({
+        type: "ai_indicator.update",
+        ai_state: "AI_STATE_GENERATING",
+        cid: channelMessage.cid,
+        message_id: channelMessage.id,
+      });
+
+      const stream = await this.openai.chat.completions.create({
+        model: "gemini-2.0-flash",
+        messages: this.conversationHistory,
+        stream: true,
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "web_search",
+              description: "Search the web for current information, news, facts, or research on any topic",
+              parameters: {
+                type: "object",
+                properties: {
+                  query: {
+                    type: "string",
+                    description: "The search query to find information about",
+                  },
+                },
+                required: ["query"],
+              },
+            },
+          },
+        ],
+        temperature: 0.7,
+      }, {
+        signal: controller.signal
+      });
+
+      let messageText = "";
+      let lastUpdateTime = 0;
+      let pendingToolCalls: any[] = [];
+
+      for await (const chunk of stream) {
+        if (controller.signal.aborted) break;
+
+        const delta = chunk.choices[0]?.delta;
+        
+        if (delta?.content) {
+          messageText += delta.content;
+          const now = Date.now();
+          
+          // Update every 1 second to avoid too many API calls
+          if (now - lastUpdateTime > 1000) {
+            await this.chatClient.partialUpdateMessage(channelMessage.id, {
+              set: { text: messageText }
+            });
+            lastUpdateTime = now;
+          }
+        }
+
+        // Handle tool calls
+        if (delta?.tool_calls) {
+          for (const toolCall of delta.tool_calls) {
+            if (!pendingToolCalls[toolCall.index]) {
+              pendingToolCalls[toolCall.index] = {
+                id: toolCall.id,
+                type: toolCall.type,
+                function: { name: "", arguments: "" }
+              };
+            }
+            
+            if (toolCall.function?.name) {
+              pendingToolCalls[toolCall.index].function.name += toolCall.function.name;
+            }
+            if (toolCall.function?.arguments) {
+              pendingToolCalls[toolCall.index].function.arguments += toolCall.function.arguments;
+            }
+          }
+        }
+
+        // Process completed tool calls
+        if (chunk.choices[0]?.finish_reason === "tool_calls" && pendingToolCalls.length > 0) {
+          await this.handleToolCalls(pendingToolCalls, channelMessage);
+          return; // Exit here as tool calls will continue the conversation
+        }
+      }
+
+      // Final update with complete message
+      await this.chatClient.partialUpdateMessage(channelMessage.id, {
+        set: { text: messageText }
+      });
+
+      // Add assistant response to conversation history
+      this.conversationHistory.push({
+        role: "assistant",
+        content: messageText
+      });
+
+      await this.channel.sendEvent({
+        type: "ai_indicator.clear",
+        cid: channelMessage.cid,
+        message_id: channelMessage.id,
+      });
+
+    } catch (error: any) {
+      if (error.name !== 'AbortError') {
+        console.error("Error in Gemini processing:", error);
+        await this.handleStreamError(error, channelMessage);
+      }
+    } finally {
+      // Remove this controller from active list
+      this.activeStreamControllers = this.activeStreamControllers.filter(c => c !== controller);
+    }
+  };
+
+  private handleToolCalls = async (toolCalls: any[], channelMessage: any) => {
+    if (!this.openai) return;
+
+    const toolResults: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
+
+    // Add the assistant's tool call message to history
+    this.conversationHistory.push({
+      role: "assistant",
+      tool_calls: toolCalls
+    });
+
+    for (const toolCall of toolCalls) {
+      if (toolCall.function.name === "web_search") {
+        try {
+          const args = JSON.parse(toolCall.function.arguments);
+          const searchResult = await this.performWebSearch(args.query);
+          
+          toolResults.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: searchResult
+          });
+        } catch (error) {
+          console.error("Error in web search:", error);
+          toolResults.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({ error: "Failed to perform web search" })
+          });
+        }
+      }
+    }
+
+    // Add tool results to conversation history
+    this.conversationHistory.push(...toolResults);
+
+    // Continue the conversation with tool results
+    await this.processMessageWithGemini(channelMessage);
+  };
+
+  private handleStopGenerating = async (event: Event) => {
+    if (!event.message_id || this.activeStreamControllers.length === 0) {
+      return;
+    }
+    
+    console.log("Stop Generating For Message", event.message_id);
+    
+    // Cancel all active streams
+    this.activeStreamControllers.forEach(controller => controller.abort());
+    this.activeStreamControllers = [];
+
+    await this.channel.sendEvent({
+      type: "ai_indicator.clear",
+      cid: event.cid,
+      message_id: event.message_id
+    });
+  };
+
+  private handleStreamError = async (error: Error, channelMessage: any) => {
+    await this.channel.sendEvent({
+      type: "ai_indicator.update",
+      ai_state: "AI_STATE_ERROR",
+      cid: channelMessage.cid,
+      message_id: channelMessage.id,
+    });
+    
+    await this.chatClient.partialUpdateMessage(channelMessage.id, {
+      set: {
+        text: error.message ?? "Error generating the message",
+      }
+    });
+  };
+
+  private performWebSearch = async (query: string): Promise<string> => {
+    const tavilyApiKey = process.env.TAVILY_API_KEY;
+    if (!tavilyApiKey) {
+      return JSON.stringify({
+        error: "Web Search is Not Available, API Key Not Configured."
+      });
+    }
+
+    console.log(`Performing Web Search For ${query}`);
+    try {
+      const response = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${tavilyApiKey}`,
+        },
+        body: JSON.stringify({
+          query: query,
+          search_depth: "advanced",
+          max_results: 5,
+          include_answer: true,
+          include_raw_content: false
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.log(`Tavily Search Failed For Query: ${query} :`, errorText);
+
+        return JSON.stringify({
+          error: `Search Failed with Status Code: ${response.status}`,
+          details: errorText,
+        });
+      }
+
+      const data = await response.json();
+      console.log(`Tavily Search Successful For Query: ${query}`);
+
+      return JSON.stringify(data);
+
+    } catch (error) {
+      console.error(`An Exception Occurred During Web Search For Query: ${query}`, error);
+
+      return JSON.stringify({
+        error: "An Exception Occurred During Web Search",
+      });
+    }
   };
 }
